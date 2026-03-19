@@ -87,14 +87,19 @@ class MarketManager:
         offset = 0
         limit = 100
 
+        # Only fetch markets with real activity (volume > 0) to avoid
+        # pulling 30K+ dead markets.  Gamma supports order=volume&ascending=false.
         while True:
             try:
                 resp = await self._client.get(
                     f"{GAMMA_API}/markets",
                     params={
                         "closed": "false",
+                        "active": "true",
                         "limit": limit,
                         "offset": offset,
+                        "order": "volume",
+                        "ascending": "false",
                     },
                 )
                 resp.raise_for_status()
@@ -108,11 +113,20 @@ class MarketManager:
             batch = resp.json()
             if not batch:
                 break
+
+            # Stop if we've hit markets with negligible volume
+            # (they're sorted by volume desc)
+            last_vol = float(batch[-1].get("volume", 0) or 0)
             markets.extend(batch)
+
             if len(batch) < limit:
                 break
+            # Stop after we pass the min volume threshold — no point
+            # loading thousands of zero-volume markets
+            if last_vol < config.MIN_MARKET_VOLUME and len(markets) >= 500:
+                break
             offset += limit
-            await asyncio.sleep(0.2)  # be nice to API
+            await asyncio.sleep(0.15)
 
         # Build lookup dicts
         new_by_condition: dict[str, Market] = {}

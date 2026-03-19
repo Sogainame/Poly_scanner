@@ -46,7 +46,18 @@ async def main() -> None:
         try:
             async with asyncio.timeout(duration):
                 async for raw in ws:
-                    data = json.loads(raw)
+                    # Skip binary or empty messages
+                    if isinstance(raw, bytes):
+                        log.debug("Binary message (%d bytes), skipping", len(raw))
+                        continue
+                    if not raw or not raw.strip():
+                        continue
+
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        log.debug("Non-JSON message: %s", raw[:100])
+                        continue
 
                     # Skip non-trade messages
                     if isinstance(data, dict) and data.get("type") in (

@@ -126,9 +126,20 @@ class WebSocketListener:
         log.info("Subscribed to %d tokens across %d qualifying markets",
                  len(token_ids), self._mm.qualifying_markets)
 
-    async def _handle_message(self, raw: str) -> None:
+    async def _handle_message(self, raw: str | bytes) -> None:
         """Parse a WS message and emit enriched trades."""
-        data = json.loads(raw)
+        # Skip binary or empty messages
+        if isinstance(raw, bytes):
+            log.debug("Binary WS message (%d bytes), skipping", len(raw))
+            return
+        if not raw or not raw.strip():
+            return
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            log.debug("Non-JSON WS message: %s", raw[:100])
+            return
 
         # Polymarket WS can send different message types
         msg_type = data.get("type", "")
