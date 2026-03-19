@@ -28,7 +28,7 @@ class WebSocketListener:
         self._last_message: datetime | None = None
         self._trades_received = 0
 
-    # ── public interface ──────────────────────────────────────────────
+    # —— public interface ——————————————————————————————————
 
     async def start(self, on_trade: Callable[[Trade], Awaitable[None]]) -> None:
         """Connect and start listening. Reconnects automatically."""
@@ -70,7 +70,7 @@ class WebSocketListener:
             "last_message": self._last_message.isoformat() if self._last_message else None,
         }
 
-    # ── internal ──────────────────────────────────────────────────────
+    # —— internal ——————————————————————————————————————————
 
     async def _connect_and_listen(self) -> None:
         """Single connection lifecycle."""
@@ -102,86 +102,73 @@ class WebSocketListener:
     async def _subscribe(self, ws: websockets.WebSocketClientProtocol) -> None:
         """Subscribe to trade channels for qualifying markets.
 
-        Polymarket WS supports subscribing to specific asset IDs.
-        Format: {"type": "subscribe", "channel": "market", "assets_id": "TOKEN_ID"}
-        
-        We subscribe in batches to avoid overwhelming the WS.
-        """
-        token_ids = self._mm.get_all_token_ids()
-        log.info("Subscribing to %d token IDs...", len(token_ids))
+        Polymarket CLOB WS subscription format:
+        ONE message with array of assets_ids:
+        {"assets_ids": ["token1", "token2", ...], "type": "market"}
 
-        # Subscribe in batches of 50
-        batch_size = 50
-        for i in range(0, len(token_ids), batch_size):
-            batch = token_ids[i : i + batch_size]
-            for tid in batch:
-                msg = json.dumps({
-                    "type": "subscribe",
-                    "channel": "market",
-                    "assets_id": tid,
-                })
-                await ws.send(msg)
-            await asyncio.sleep(0.1)  # small delay between batches
+        Max 500 assets per connection (undocumented Polymarket limit).
+        We split into multiple subscription messages if needed.
+        """
+        all_token_ids = self._mm.get_all_token_ids()
+        log.info("Subscribing to %d token IDs...", len(all_token_ids))
+
+        # Split into chunks of 500 (Polymarket limit per connection)
+        chunk_size = 500
+        for i in range(0, len(all_token_ids), chunk_size):
+            chunk = all_token_ids[i : i + chunk_size]
+            msg = json.dumps({
+                "assets_ids": chunk,
+                "type": "market",
+            })
+            await ws.send(msg)
+            if i + chunk_size < len(all_token_ids):
+                await asyncio.sleep(0.2)  # small delay between chunks
 
         log.info("Subscribed to %d tokens across %d qualifying markets",
-                 len(token_ids), self._mm.qualifying_markets)
+                 len(all_token_ids), self._mm.qualifying_markets)
 
     async def _handle_message(self, raw: str | bytes) -> None:
         """Parse a WS message and emit enriched trades."""
-        # Skip binary or empty messages
+        # Handle binary messages
         if isinstance(raw, bytes):
-            log.debug("Binary WS message (%d bytes), skipping", len(raw))
-            return
-        if not raw or not raw.strip():
-            return
+            try:
+                raw = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            log.debug("Non-JSON WS message: %s", raw[:100])
             return
 
-        # Polymarket WS can send different message types
-        msg_type = data.get("type", "")
+        # WS can send a single event dict or an array of events
+        events = data if isinstance(data, list) else [data]
 
-        # Trade/match messages
-        if msg_type in ("last_trade_price", "price_change"):
-            # These are price updates, not individual trades — skip
-            return
+        for event in events:
+            if not isinstance(event, dict):
+                continue
 
-        # The actual trade stream format varies. Common patterns:
-        # 1. {"asset_id": "...", "price": "0.55", "size": "100", "side": "BUY", ...}
-        # 2. {"type": "trade", "data": {...}}
-        # 3. Array of trades
+            event_type = event.get("event_type", "")
 
-        trades_data = []
+            # last_trade_price is the trade event we care about
+            # Format: {"event_type": "last_trade_price", "asset_id": "...",
+            #          "market": "0x...", "price": "0.52", "size": "100",
+            #          "side": "BUY", "timestamp": 1234567890000}
+            if event_type == "last_trade_price":
+                trade = self._parse_trade(event)
+                if trade and not self._mm.is_excluded(trade.token_id):
+                    self._trades_received += 1
+                    await self._on_trade(trade)
 
-        if isinstance(data, list):
-            trades_data = data
-        elif "data" in data and isinstance(data["data"], list):
-            trades_data = data["data"]
-        elif "data" in data and isinstance(data["data"], dict):
-            trades_data = [data["data"]]
-        elif "asset_id" in data:
-            trades_data = [data]
-        elif "market" in data and isinstance(data["market"], str):
-            # Some messages are just subscription confirmations
-            return
-        else:
-            # Unknown format — log at debug level
-            log.debug("Unknown WS message format: %s", str(data)[:300])
-            return
-
-        for td in trades_data:
-            trade = self._parse_trade(td)
-            if trade and not self._mm.is_excluded(trade.token_id):
-                self._trades_received += 1
-                await self._on_trade(trade)
+            # book and price_change events are skipped — we only want trades
+            # Other event types logged at debug level
+            elif event_type not in ("book", "price_change", "tick_size_change"):
+                log.debug("Unhandled WS event type: %s", event_type)
 
     def _parse_trade(self, data: dict) -> Trade | None:
-        """Parse a single trade dict into a Trade model."""
+        """Parse a last_trade_price event into a Trade model."""
         try:
-            token_id = str(data.get("asset_id") or data.get("token_id") or "")
+            token_id = str(data.get("asset_id") or "")
             if not token_id:
                 return None
 
@@ -217,21 +204,20 @@ class WebSocketListener:
             if side not in ("BUY", "SELL"):
                 side = "BUY"
 
-            # Wallet — could be taker_address, maker_address, or just address
-            wallet = str(
-                data.get("taker_address")
-                or data.get("maker_address")
-                or data.get("owner")
-                or data.get("trader")
-                or data.get("address")
-                or "unknown"
-            )
+            # Wallet — last_trade_price does NOT include wallet address
+            # We'll use "unknown" for now; wallet tracking requires
+            # either the user channel (authenticated) or the Data API
+            wallet = "unknown"
 
-            # Timestamp
-            ts_raw = data.get("timestamp") or data.get("match_time")
+            # Timestamp — can be milliseconds
+            ts_raw = data.get("timestamp")
             if ts_raw:
                 try:
-                    ts = datetime.fromtimestamp(int(ts_raw), tz=timezone.utc)
+                    ts_int = int(ts_raw)
+                    # If timestamp > 1e12, it's in milliseconds
+                    if ts_int > 1e12:
+                        ts_int = ts_int // 1000
+                    ts = datetime.fromtimestamp(ts_int, tz=timezone.utc)
                 except (ValueError, TypeError, OSError):
                     ts = datetime.now(timezone.utc)
             else:

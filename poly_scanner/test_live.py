@@ -25,67 +25,88 @@ async def main() -> None:
     await mm.start()
     log.info("Loaded %d markets (%d qualifying)", mm.total_markets, mm.qualifying_markets)
 
-    # Get a sample of token IDs to subscribe
-    tokens = mm.get_all_token_ids()[:100]  # subscribe to first 100 for testing
+    # Get token IDs to subscribe (max 500 per WS connection)
+    tokens = mm.get_all_token_ids()[:500]
     log.info("Subscribing to %d tokens for %d seconds...", len(tokens), duration)
 
     trade_count = 0
+    book_count = 0
+    other_count = 0
 
     async with websockets.connect(
         config.WS_URL, ping_interval=30, ping_timeout=10,
     ) as ws:
-        for tid in tokens:
-            await ws.send(json.dumps({
-                "type": "subscribe",
-                "channel": "market",
-                "assets_id": tid,
-            }))
-        await asyncio.sleep(0.5)
-        log.info("Subscribed. Listening...")
+        # CORRECT subscription format: ONE message with array of assets_ids
+        sub_msg = json.dumps({
+            "assets_ids": tokens,
+            "type": "market",
+        })
+        await ws.send(sub_msg)
+        log.info("Subscription sent. Listening...")
 
         try:
             async with asyncio.timeout(duration):
                 async for raw in ws:
-                    # Skip binary or empty messages
+                    # Handle binary messages
                     if isinstance(raw, bytes):
-                        log.debug("Binary message (%d bytes), skipping", len(raw))
-                        continue
-                    if not raw or not raw.strip():
-                        continue
+                        try:
+                            raw = raw.decode("utf-8")
+                        except UnicodeDecodeError:
+                            continue
 
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError:
-                        log.debug("Non-JSON message: %s", raw[:100])
                         continue
 
-                    # Skip non-trade messages
-                    if isinstance(data, dict) and data.get("type") in (
-                        "subscribed", "connected", "last_trade_price", "price_change"
-                    ):
-                        continue
+                    # Handle arrays of events
+                    events = data if isinstance(data, list) else [data]
 
-                    trade_count += 1
+                    for event in events:
+                        if not isinstance(event, dict):
+                            continue
 
-                    # Try to extract trade info
-                    if isinstance(data, dict) and "asset_id" in data:
-                        token_id = data.get("asset_id", "")
-                        market = mm.get_market_by_token(token_id)
-                        title = market.title[:50] if market else "UNKNOWN"
-                        price = data.get("price", "?")
-                        size = data.get("size", "?")
-                        side = data.get("side", "?")
-                        log.info(
-                            "Trade #%d: %s %s @ %s (%s shares) — %s",
-                            trade_count, side, "Yes/No", price, size, title,
-                        )
-                    else:
-                        log.info("Message #%d: %s", trade_count, str(data)[:200])
+                        event_type = event.get("event_type", "")
+
+                        if event_type == "last_trade_price":
+                            trade_count += 1
+                            token_id = event.get("asset_id", "")
+                            market = mm.get_market_by_token(token_id)
+                            title = market.title[:60] if market else "UNKNOWN"
+                            price = event.get("price", "?")
+                            size = event.get("size", "?")
+                            side = event.get("side", "?")
+
+                            # Calculate USD value
+                            try:
+                                usd = float(price) * float(size)
+                                usd_str = f"${usd:,.2f}"
+                            except (ValueError, TypeError):
+                                usd_str = "?"
+
+                            log.info(
+                                "TRADE #%d: %s %s @ %s (%s shares, %s) — %s",
+                                trade_count, side, "Yes/No", price, size, usd_str, title,
+                            )
+
+                        elif event_type == "book":
+                            book_count += 1
+
+                        elif event_type == "price_change":
+                            pass  # ignore silently
+
+                        else:
+                            other_count += 1
+                            if other_count <= 5:
+                                log.info("Other event: %s — %s", event_type, str(event)[:200])
 
         except TimeoutError:
             pass
 
-    log.info("Done. Received %d messages in %d seconds.", trade_count, duration)
+    log.info(
+        "Done in %ds. Trades: %d, Book updates: %d, Other: %d",
+        duration, trade_count, book_count, other_count,
+    )
     await mm.stop()
 
 
