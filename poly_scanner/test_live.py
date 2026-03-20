@@ -17,6 +17,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefm
 log = logging.getLogger(__name__)
 
 
+async def ping_loop(ws: websockets.WebSocketClientProtocol) -> None:
+    """Send PING every 10 seconds as required by Polymarket WS."""
+    try:
+        while True:
+            await asyncio.sleep(10)
+            await ws.send("PING")
+    except (asyncio.CancelledError, websockets.exceptions.ConnectionClosed):
+        pass
+
+
 async def main() -> None:
     duration = int(sys.argv[1]) if len(sys.argv) > 1 else 60
 
@@ -25,8 +35,8 @@ async def main() -> None:
     await mm.start()
     log.info("Loaded %d markets (%d qualifying)", mm.total_markets, mm.qualifying_markets)
 
-    # Get token IDs to subscribe (max 500 per WS connection)
-    tokens = mm.get_all_token_ids()[:500]
+    # Top markets by volume — enough to see trades quickly
+    tokens = mm.get_all_token_ids()[:100]
     log.info("Subscribing to %d tokens for %d seconds...", len(tokens), duration)
 
     trade_count = 0
@@ -34,16 +44,20 @@ async def main() -> None:
     other_count = 0
 
     async with websockets.connect(
-        config.WS_URL, ping_interval=30, ping_timeout=10,
+        config.WS_URL, ping_interval=None, ping_timeout=None,
     ) as ws:
-        # CORRECT subscription format: ONE message with array of assets_ids
+        # Subscribe: ONE message with array of assets_ids
         sub_msg = json.dumps({
             "assets_ids": tokens,
             "type": "market",
         })
         await ws.send(sub_msg)
-        log.info("Subscription sent. Listening...")
+        log.info("Subscription sent.")
 
+        # Start heartbeat task
+        ping_task = asyncio.create_task(ping_loop(ws))
+
+        log.info("Listening for events...")
         try:
             async with asyncio.timeout(duration):
                 async for raw in ws:
@@ -54,9 +68,14 @@ async def main() -> None:
                         except UnicodeDecodeError:
                             continue
 
+                    # Handle PONG response
+                    if raw == "PONG":
+                        continue
+
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError:
+                        log.debug("Non-JSON message: %s", raw[:100])
                         continue
 
                     # Handle arrays of events
@@ -77,7 +96,6 @@ async def main() -> None:
                             size = event.get("size", "?")
                             side = event.get("side", "?")
 
-                            # Calculate USD value
                             try:
                                 usd = float(price) * float(size)
                                 usd_str = f"${usd:,.2f}"
@@ -85,23 +103,30 @@ async def main() -> None:
                                 usd_str = "?"
 
                             log.info(
-                                "TRADE #%d: %s %s @ %s (%s shares, %s) — %s",
-                                trade_count, side, "Yes/No", price, size, usd_str, title,
+                                "TRADE #%d: %s @ %s (%s shares, %s) — %s",
+                                trade_count, side, price, size, usd_str, title,
                             )
 
                         elif event_type == "book":
                             book_count += 1
+                            if book_count <= 3:
+                                log.info("Book update for %s", event.get("asset_id", "?")[:20])
 
                         elif event_type == "price_change":
-                            pass  # ignore silently
+                            pass  # very noisy, skip
+
+                        elif event_type == "tick_size_change":
+                            pass
 
                         else:
                             other_count += 1
-                            if other_count <= 5:
-                                log.info("Other event: %s — %s", event_type, str(event)[:200])
+                            if other_count <= 10:
+                                log.info("Event [%s]: %s", event_type, str(event)[:200])
 
         except TimeoutError:
             pass
+        finally:
+            ping_task.cancel()
 
     log.info(
         "Done in %ds. Trades: %d, Book updates: %d, Other: %d",
